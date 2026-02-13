@@ -25,6 +25,13 @@ var (
 	keywordPattern = regexp.MustCompile(`(?i)(?:带宽|bandwidth|bw)\s*[:=]\s*(\d+(?:\.\d+)?)\s*([mg])(?:bps)?`)
 	tokenPattern   = regexp.MustCompile(`(?i)^(\d+(?:\.\d+)?)\s*([mg])(?:bps)?$`)
 	splitPattern   = regexp.MustCompile(`[\s,|;]+`)
+	tablePattern   = regexp.MustCompile(`(?is)<table[^>]*>.*?</table>`)
+	tbodyPattern   = regexp.MustCompile(`(?is)<tbody[^>]*>(.*?)</tbody>`)
+	rowPattern     = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
+	tdPattern      = regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`)
+	tagPattern     = regexp.MustCompile(`(?is)<[^>]+>`)
+	ipXPath        = `//*[@id="result"]/table/tbody/tr[*]/td[2]`
+	bwXPath        = `//*[@id="result"]/table/tbody/tr[*]/td[6]`
 )
 
 type NodeStore struct {
@@ -115,6 +122,10 @@ func fetch(url string) (string, error) {
 }
 
 func filterLines(content string, thresholdMbps float64) []string {
+	if rows := filterNodesByXPath(content, thresholdMbps); len(rows) > 0 {
+		return rows
+	}
+
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	result := make([]string, 0)
 
@@ -131,6 +142,60 @@ func filterLines(content string, thresholdMbps float64) []string {
 	}
 
 	return result
+}
+
+func filterNodesByXPath(content string, thresholdMbps float64) []string {
+	block := content
+	if idx := strings.Index(content, `id="result"`); idx >= 0 {
+		block = content[idx:]
+	} else if idx := strings.Index(content, `id='result'`); idx >= 0 {
+		block = content[idx:]
+	}
+
+	tableHTML := tablePattern.FindString(block)
+	if tableHTML == "" {
+		return nil
+	}
+
+	tbody := tbodyPattern.FindStringSubmatch(tableHTML)
+	if len(tbody) < 2 {
+		return nil
+	}
+
+	rows := rowPattern.FindAllStringSubmatch(tbody[1], -1)
+	result := make([]string, 0, len(rows))
+	for _, row := range rows {
+		cols := tdPattern.FindAllStringSubmatch(row[1], -1)
+		if len(cols) < 6 {
+			continue
+		}
+
+		ip := htmlText(cols[1][1])
+		bwText := htmlText(cols[5][1])
+		if ip == "" || bwText == "" {
+			continue
+		}
+
+		bw, ok := extractBandwidthMbps(bwText)
+		if !ok || bw <= thresholdMbps {
+			continue
+		}
+
+		result = append(result, fmt.Sprintf("%s 带宽:%s", ip, bwText))
+	}
+
+	return result
+}
+
+func htmlText(s string) string {
+	text := tagPattern.ReplaceAllString(s, "")
+	text = strings.ReplaceAll(text, "&nbsp;", " ")
+	text = strings.ReplaceAll(text, "&amp;", "&")
+	text = strings.ReplaceAll(text, "&lt;", "<")
+	text = strings.ReplaceAll(text, "&gt;", ">")
+	text = strings.ReplaceAll(text, "&#39;", "'")
+	text = strings.ReplaceAll(text, "&quot;", `"`)
+	return strings.TrimSpace(text)
 }
 
 func extractBandwidthMbps(line string) (float64, bool) {
