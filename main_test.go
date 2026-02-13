@@ -42,6 +42,22 @@ func TestFilterLines(t *testing.T) {
 	}
 }
 
+func TestFilterLinesWithResultTable(t *testing.T) {
+	html := `<div id="result"><table><tbody>
+	<tr><td>1</td><td>1.1.1.1</td><td>x</td><td>x</td><td>x</td><td>250M</td></tr>
+	<tr><td>2</td><td>2.2.2.2</td><td>x</td><td>x</td><td>x</td><td>150M</td></tr>
+	<tr><td>3</td><td>3.3.3.3</td><td>x</td><td>x</td><td>x</td><td>0.5G</td></tr>
+	</tbody></table></div>`
+
+	got := filterLines(html, 200)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want=2", len(got))
+	}
+	if got[0] != "1.1.1.1 带宽:250M" || got[1] != "3.3.3.3 带宽:0.5G" {
+		t.Fatalf("unexpected result: %#v", got)
+	}
+}
+
 func TestNodesAPI(t *testing.T) {
 	store := &NodeStore{}
 	now := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
