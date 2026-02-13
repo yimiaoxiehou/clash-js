@@ -6,17 +6,19 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (
-	defaultURL      = "https://api.uouin.com/cloudflare.html"
-	defaultInterval = 30 * time.Minute
+	defaultURL       = "https://api.uouin.com/cloudflare.html"
+	defaultInterval  = 30 * time.Minute
+	defaultThreshold = 200.0
 )
 
 var (
@@ -25,49 +27,73 @@ var (
 	splitPattern   = regexp.MustCompile(`[\s,|;]+`)
 )
 
+type NodeStore struct {
+	mu        sync.RWMutex
+	nodes     []string
+	updatedAt time.Time
+	lastError string
+}
+
+func (s *NodeStore) Set(nodes []string, updatedAt time.Time, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.nodes = append([]string(nil), nodes...)
+	s.updatedAt = updatedAt
+	if err != nil {
+		s.lastError = err.Error()
+		return
+	}
+	s.lastError = ""
+}
+
+func (s *NodeStore) Snapshot() ([]string, time.Time, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.nodes...), s.updatedAt, s.lastError
+}
+
 func main() {
 	source := defaultURL
 	if len(os.Args) > 1 {
 		source = os.Args[1]
 	}
 
-	runOnce(source)
+	store := &NodeStore{}
+	startPolling(source, defaultInterval, defaultThreshold, store)
 
-	ticker := time.NewTicker(defaultInterval)
-	defer ticker.Stop()
+	r := newRouter(store, defaultThreshold)
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	for {
-		select {
-		case <-ticker.C:
-			runOnce(source)
-		case sig := <-sigCh:
-			fmt.Printf("收到信号 %s，程序退出\n", sig)
-			return
-		}
+	if err := r.Run(":8080"); err != nil {
+		fmt.Fprintf(os.Stderr, "启动 Gin 服务失败: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func runOnce(source string) {
-	fmt.Printf("[%s] 开始拉取节点数据\n", time.Now().Format(time.RFC3339))
+func startPolling(source string, interval time.Duration, thresholdMbps float64, store *NodeStore) {
+	runAndStore(source, thresholdMbps, store)
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			runAndStore(source, thresholdMbps, store)
+		}
+	}()
+}
+
+func runAndStore(source string, thresholdMbps float64, store *NodeStore) {
+	now := time.Now()
 	content, err := fetch(source)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取数据失败: %v\n", err)
+		store.Set(nil, now, err)
+		fmt.Fprintf(os.Stderr, "[%s] 读取数据失败: %v\n", now.Format(time.RFC3339), err)
 		return
 	}
 
-	filtered := filterLines(content, 200)
-	if len(filtered) == 0 {
-		fmt.Println("未找到带宽大于 200M 的节点")
-		return
-	}
-
-	for _, line := range filtered {
-		fmt.Println(line)
-	}
+	filtered := filterLines(content, thresholdMbps)
+	store.Set(filtered, now, nil)
+	fmt.Printf("[%s] 节点刷新完成，命中 %d 条\n", now.Format(time.RFC3339), len(filtered))
 }
 
 func fetch(url string) (string, error) {
@@ -140,4 +166,19 @@ func convertToMbps(number, unit string) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func newRouter(store *NodeStore, threshold float64) *gin.Engine {
+	r := gin.Default()
+	r.GET("/nodes", func(c *gin.Context) {
+		nodes, updatedAt, lastErr := store.Snapshot()
+		c.JSON(http.StatusOK, gin.H{
+			"count":       len(nodes),
+			"threshold_m": threshold,
+			"updated_at":  updatedAt.Format(time.RFC3339),
+			"last_error":  lastErr,
+			"nodes":       nodes,
+		})
+	})
+	return r
 }
